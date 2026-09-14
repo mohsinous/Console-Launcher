@@ -37,6 +37,7 @@ def _app_dir():
 APP_DIR = _app_dir()
 CONFIG_FILE = APP_DIR / "config.json"
 ICONS_DIR = APP_DIR / "icons"
+EMULATORS_DIR = APP_DIR / "emulators"
 
 
 def _ensure_icons_dir():
@@ -181,6 +182,418 @@ def autolink_icons(config):
             changed = True
 
     return changed
+
+
+# ---------------------------------------------------------------------------
+# Emulator executable auto-discovery
+# ---------------------------------------------------------------------------
+
+_GENERIC_EXE_TOKENS = {
+    "qt", "sdl", "sdl2", "sdl3", "windows", "win", "win64", "x64", "x86",
+    "launcher", "app", "gui", "main", "release", "debug", "portable",
+    "setup", "install", "uninstall", "update", "updater", "canary",
+}
+
+
+def _candidate_exes(folder):
+    folder = Path(folder)
+    if not folder.is_dir():
+        return
+
+    roots = [folder]
+    for child in folder.iterdir():
+        if child.is_dir():
+            roots.append(child)
+
+    seen = set()
+
+    for root in roots:
+        try:
+            for entry in root.iterdir():
+                if not entry.is_file():
+                    continue
+                if entry.suffix.lower() != ".exe":
+                    continue
+
+                low = entry.name.lower()
+                if any(bad in low for bad in (
+                    "unins", "install", "updat", "setup",
+                    "crashhandler", "crashreport", "vcredist",
+                )):
+                    continue
+
+                key = str(entry.resolve()).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                yield entry
+        except Exception:
+            continue
+
+
+def _score_exe(exe, emulator_name, folder_name):
+    stem_key = _normalize(exe.stem)
+    name_key = _normalize(emulator_name)
+    folder_key = _normalize(folder_name)
+
+    if not stem_key:
+        return 0
+
+    score = 0
+
+    if name_key and stem_key.startswith(name_key):
+        score += 100
+        if stem_key == name_key:
+            score += 40
+
+    if folder_key and stem_key.startswith(folder_key):
+        score += 80
+        if stem_key == folder_key:
+            score += 40
+
+    if name_key and name_key in stem_key:
+        score += 20
+    if folder_key and folder_key in stem_key:
+        score += 15
+
+    if name_key and name_key not in stem_key and folder_key not in stem_key:
+        if stem_key in _GENERIC_EXE_TOKENS:
+            return 0
+
+    return score
+
+
+def _iter_emulator_folders():
+    roots = []
+
+    if EMULATORS_DIR.is_dir():
+        roots.append(EMULATORS_DIR)
+
+    roots.append(APP_DIR)
+
+    seen = set()
+
+    for root in roots:
+        try:
+            for entry in sorted(root.iterdir()):
+                if not entry.is_dir():
+                    continue
+
+                if entry.name.lower() in {
+                    "icons", "emulators", "build", "dist",
+                    "__pycache__", ".git", ".venv", "venv",
+                }:
+                    continue
+
+                key = str(entry.resolve()).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                yield entry
+        except Exception:
+            continue
+
+
+def find_executable_for_emulator(emulator_name):
+    if not emulator_name:
+        return None
+
+    name_key = _normalize(emulator_name)
+    if not name_key:
+        return None
+
+    best = None
+
+    for folder in _iter_emulator_folders():
+        folder_key = _normalize(folder.name)
+
+        if not (
+            folder_key == name_key
+            or folder_key.startswith(name_key)
+            or name_key.startswith(folder_key)
+            or name_key in folder_key
+            or folder_key in name_key
+        ):
+            continue
+
+        for exe in _candidate_exes(folder):
+            score = _score_exe(exe, emulator_name, folder.name)
+
+            if score <= 0:
+                continue
+
+            if exe.parent == folder:
+                score += 5
+
+            if best is None or score > best[0]:
+                best = (score, exe)
+
+    return best[1] if best else None
+
+
+def autolink_executables(config):
+    changed = False
+
+    for emulator in config.get("emulators", []):
+        current = (emulator.get("executable") or "").strip()
+
+        if current and Path(current).exists():
+            continue
+
+        found = find_executable_for_emulator(
+            emulator.get("name", "")
+        )
+
+        if found and found.exists():
+            emulator["executable"] = str(found)
+            changed = True
+
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# Console / platform auto-detection
+# ---------------------------------------------------------------------------
+
+# Aliases are checked in order — longer, more specific ones first so
+# "playstation 2" is caught before "playstation", "xbox 360" before "xbox", etc.
+_PLATFORM_ALIASES = [
+    # SONY
+    ("playstation 5", "PlayStation 5"),
+    ("playstation5", "PlayStation 5"),
+    ("ps5", "PlayStation 5"),
+    ("playstation 4", "PlayStation 4"),
+    ("playstation4", "PlayStation 4"),
+    ("ps4", "PlayStation 4"),
+    ("shadps4", "PlayStation 4"),
+    ("playstation 3", "PlayStation 3"),
+    ("playstation3", "PlayStation 3"),
+    ("ps3", "PlayStation 3"),
+    ("rpcs3", "PlayStation 3"),
+    ("playstation 2", "PlayStation 2"),
+    ("playstation2", "PlayStation 2"),
+    ("ps2", "PlayStation 2"),
+    ("pcsx2", "PlayStation 2"),
+    ("playstation vita", "PlayStation Vita"),
+    ("playstationvita", "PlayStation Vita"),
+    ("ps vita", "PlayStation Vita"),
+    ("psvita", "PlayStation Vita"),
+    ("vita3k", "PlayStation Vita"),
+    ("psp", "PlayStation Portable"),
+    ("playstation portable", "PlayStation Portable"),
+    ("playstationportable", "PlayStation Portable"),
+    ("ppsspp", "PlayStation Portable"),
+    ("playstation 1", "PlayStation 1"),
+    ("playstation1", "PlayStation 1"),
+    ("ps1", "PlayStation 1"),
+    ("psx", "PlayStation 1"),
+    ("duckstation", "PlayStation 1"),
+
+    # MICROSOFT
+    ("xbox 360", "Xbox 360"),
+    ("xbox360", "Xbox 360"),
+    ("xenia edge", "Xbox 360"),
+    ("xenia canary", "Xbox 360"),
+    ("xenia", "Xbox 360"),
+    ("xbox", "Xbox"),
+    ("xemu", "Xbox"),
+
+    # NINTENDO
+    ("nintendo switch", "Nintendo Switch"),
+    ("nintendoswitch", "Nintendo Switch"),
+    ("switch", "Nintendo Switch"),
+    ("ryujinx", "Nintendo Switch"),
+    ("citron", "Nintendo Switch"),
+    ("yuzu", "Nintendo Switch"),
+    ("wii u", "Wii U"),
+    ("wiiu", "Wii U"),
+    ("cemu", "Wii U"),
+    ("gamecube", "GameCube"),
+    ("dolphin", "GameCube"),
+    ("wii", "Wii"),
+    ("nintendo 3ds", "Nintendo 3DS"),
+    ("nintendo3ds", "Nintendo 3DS"),
+    ("3ds", "Nintendo 3DS"),
+    ("azahar", "Nintendo 3DS"),
+    ("citra", "Nintendo 3DS"),
+    ("nintendo ds", "Nintendo DS"),
+    ("nintendods", "Nintendo DS"),
+    ("nds", "Nintendo DS"),
+    ("melonds", "Nintendo DS"),
+    ("nintendo 64", "Nintendo 64"),
+    ("nintendo64", "Nintendo 64"),
+    ("n64", "Nintendo 64"),
+    ("gopher", "Nintendo 64"),
+    ("project64", "Nintendo 64"),
+    ("project 64", "Nintendo 64"),
+
+    # SEGA
+    ("sega saturn", "Sega Saturn"),
+    ("segasaturn", "Sega Saturn"),
+    ("saturn", "Sega Saturn"),
+    ("ymir", "Sega Saturn"),
+    ("sega dreamcast", "Sega Dreamcast"),
+    ("segadreamcast", "Sega Dreamcast"),
+    ("dreamcast", "Sega Dreamcast"),
+    ("flycast", "Sega Dreamcast"),
+    ("redream", "Sega Dreamcast"),
+
+    # HANDHELD
+    ("game boy advance", "Game Boy Advance"),
+    ("gameboyadvance", "Game Boy Advance"),
+    ("gba", "Game Boy Advance"),
+    ("mgba", "Game Boy Advance"),
+    ("visualboyadvance", "Game Boy Advance"),
+    ("visual boy advance", "Game Boy Advance"),
+]
+
+
+def detect_platform(*hints):
+    """Return a canonical platform name from any of the given hints.
+
+    Hints can be a folder name, an exe stem, or an emulator name. The
+    longest matching alias wins, so "xenia canary" beats "xenia".
+    """
+    best = None  # (alias_length, platform)
+
+    for hint in hints:
+        if not hint:
+            continue
+
+        key = _normalize(hint)
+        if not key:
+            continue
+
+        for alias, platform in _PLATFORM_ALIASES:
+            alias_key = _normalize(alias)
+
+            if alias_key in key:
+                length = len(alias_key)
+                if best is None or length > best[0]:
+                    best = (length, platform)
+
+    return best[1] if best else None
+
+
+def autolink_platforms(config):
+    """Fill in / correct the platform for every emulator based on its
+    name, executable, and folder. Returns True if anything changed.
+    """
+    changed = False
+
+    for emulator in config.get("emulators", []):
+        current = (emulator.get("platform") or "").strip()
+
+        # Already known and valid → leave alone.
+        if current and current in PLATFORMS:
+            continue
+
+        name = emulator.get("name", "")
+        exe = emulator.get("executable", "")
+
+        hints = [name, Path(exe).stem if exe else ""]
+
+        # Add the folder the executable lives in (or its parent).
+        if exe:
+            try:
+                exe_path = Path(exe)
+                if exe_path.exists():
+                    hints.append(exe_path.parent.name)
+                    hints.append(exe_path.parent.parent.name)
+            except Exception:
+                pass
+
+        detected = detect_platform(*hints)
+
+        if detected and detected != current:
+            emulator["platform"] = detected
+            changed = True
+
+    return changed
+
+
+def discover_new_emulators(config):
+    """Add any emulator folder that isn't already in config.json.
+
+    Each new entry gets a name derived from the folder, a matching
+    platform if one can be detected, and an auto-linked executable.
+    Returns True if entries were added.
+    """
+    known_paths = set()
+    known_names = set()
+
+    for emulator in config.get("emulators", []):
+        name = emulator.get("name", "")
+        if name:
+            known_names.add(_normalize(name))
+
+        exe = emulator.get("executable", "")
+        if exe:
+            try:
+                known_paths.add(str(Path(exe).resolve()).lower())
+            except Exception:
+                pass
+
+    added = False
+
+    for folder in _iter_emulator_folders():
+        # Skip folders that have no runnable exe at all.
+        exes = list(_candidate_exes(folder))
+        if not exes:
+            continue
+
+        folder_key = _normalize(folder.name)
+
+        # Already represented by name?
+        if folder_key in known_names:
+            continue
+
+        # Pick the best exe inside this folder using the folder name
+        # as the emulator name.
+        best = None
+        for exe in exes:
+            score = _score_exe(exe, folder.name, folder.name)
+            if score <= 0:
+                continue
+            if exe.parent == folder:
+                score += 5
+            if best is None or score > best[0]:
+                best = (score, exe)
+
+        if best is None:
+            # Fall back to the first exe in the folder.
+            best = (0, exes[0])
+
+        chosen = best[1]
+
+        # Already represented by executable path?
+        try:
+            if str(chosen.resolve()).lower() in known_paths:
+                continue
+        except Exception:
+            pass
+
+        platform = detect_platform(
+            folder.name,
+            chosen.stem,
+            chosen.parent.name,
+        ) or "Other"
+
+        config["emulators"].append({
+            "name": folder.name,
+            "platform": platform,
+            "executable": str(chosen),
+            "icon": find_icon_for_name(folder.name) or "",
+            "arguments": "",
+            "run_as_admin": False,
+        })
+
+        known_names.add(folder_key)
+        added = True
+
+    return added
 
 
 # ---------------------------------------------------------------------------
@@ -375,9 +788,13 @@ class EmulatorDialog(QDialog):
         exe_browse = QPushButton("Browse...")
         exe_browse.clicked.connect(self.browse_executable)
 
+        exe_auto = QPushButton("Auto-find")
+        exe_auto.clicked.connect(self.autofind_executable)
+
         exe_row = QHBoxLayout()
         exe_row.addWidget(self.exe_edit)
         exe_row.addWidget(exe_browse)
+        exe_row.addWidget(exe_auto)
 
         self.icon_edit = QLineEdit()
         resolved = resolve_icon(self.emulator.get("icon", ""))
@@ -444,6 +861,59 @@ class EmulatorDialog(QDialog):
 
             if not self.name_edit.text().strip():
                 self.name_edit.setText(Path(path).stem)
+
+            self.maybe_autofill_platform()
+
+    def autofind_executable(self):
+        name = self.name_edit.text().strip()
+
+        if not name:
+            QMessageBox.information(
+                self,
+                "Name Required",
+                "Enter the emulator name first, then click Auto-find."
+            )
+            return
+
+        found = find_executable_for_emulator(name)
+
+        if not found:
+            QMessageBox.information(
+                self,
+                "Not Found",
+                f'Could not find an .exe matching "{name}" in the '
+                f"folders next to the app."
+            )
+            return
+
+        self.exe_edit.setText(str(found))
+        self.maybe_autofill_platform()
+
+    def maybe_autofill_platform(self):
+        """If the user hasn't chosen a platform yet, try to detect one."""
+        current = self.platform_combo.currentText()
+
+        if current and current != "Other":
+            return
+
+        name = self.name_edit.text().strip()
+        exe = self.exe_edit.text().strip()
+
+        hints = [name]
+        if exe:
+            hints.append(Path(exe).stem)
+            try:
+                hints.append(Path(exe).parent.name)
+                hints.append(Path(exe).parent.parent.name)
+            except Exception:
+                pass
+
+        detected = detect_platform(*hints)
+
+        if detected:
+            index = self.platform_combo.findText(detected)
+            if index >= 0:
+                self.platform_combo.setCurrentIndex(index)
 
     def browse_icon(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -519,9 +989,26 @@ class EmulatorDialog(QDialog):
         if not stored_icon:
             stored_icon = find_icon_for_name(name)
 
+        platform = self.platform_combo.currentText()
+
+        # Last-chance auto detection if it's still "Other".
+        if not platform or platform == "Other":
+            exe = self.exe_edit.text().strip()
+            hints = [name]
+            if exe:
+                hints.append(Path(exe).stem)
+                try:
+                    hints.append(Path(exe).parent.name)
+                    hints.append(Path(exe).parent.parent.name)
+                except Exception:
+                    pass
+            detected = detect_platform(*hints)
+            if detected:
+                platform = detected
+
         return {
             "name": name,
-            "platform": self.platform_combo.currentText(),
+            "platform": platform,
             "executable": self.exe_edit.text().strip(),
             "icon": stored_icon,
             "arguments": self.args_edit.text().strip(),
@@ -530,12 +1017,10 @@ class EmulatorDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
-# Compact clickable tile — sized to fit a full 1080p screen without scrolling.
+# Compact clickable tile
 # ---------------------------------------------------------------------------
 
 class EmulatorCard(QFrame):
-    """Compact clickable tile. One click launches the emulator."""
-
     CARD_W = 132
     CARD_H = 132
 
@@ -676,16 +1161,22 @@ class SettingsDialog(QDialog):
         edit = QPushButton("✎ Edit")
         remove = QPushButton("－ Remove")
         test = QPushButton("▶ Test Launch")
+        relink = QPushButton("⟳ Auto-find")
+        scan = QPushButton("⌕ Scan folders")
 
         add.clicked.connect(self.add_emulator)
         edit.clicked.connect(self.edit_emulator)
         remove.clicked.connect(self.remove_emulator)
         test.clicked.connect(self.test_emulator)
+        relink.clicked.connect(self.autofind_all)
+        scan.clicked.connect(self.scan_folders)
 
         buttons.addWidget(add)
         buttons.addWidget(edit)
         buttons.addWidget(remove)
         buttons.addWidget(test)
+        buttons.addWidget(relink)
+        buttons.addWidget(scan)
         buttons.addStretch()
 
         root.addLayout(buttons)
@@ -789,6 +1280,48 @@ class SettingsDialog(QDialog):
             self.config["emulators"][index]
         )
 
+    def autofind_all(self):
+        exes = autolink_executables(self.config)
+        plats = autolink_platforms(self.config)
+
+        if exes or plats:
+            self.refresh()
+            QMessageBox.information(
+                self,
+                "Auto-find",
+                "Executables and/or platforms were updated."
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Auto-find",
+                "Nothing new to link — everything is already valid."
+            )
+
+    def scan_folders(self):
+        added = discover_new_emulators(self.config)
+
+        # Even if nothing new, still refresh the platforms/exes of the
+        # existing entries.
+        autolink_executables(self.config)
+        autolink_platforms(self.config)
+        autolink_icons(self.config)
+
+        self.refresh()
+
+        if added:
+            QMessageBox.information(
+                self,
+                "Scan folders",
+                "New emulator folders were detected and added."
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Scan folders",
+                "No new emulator folders found next to the app."
+            )
+
     def accept(self):
         save_config(self.config)
         super().accept()
@@ -804,7 +1337,17 @@ class MainWindow(QMainWindow):
 
         self.config = load_config()
 
-        if autolink_icons(self.config):
+        # Auto-discover before first paint:
+        #   1. find any new emulator folders → add them
+        #   2. fix any missing executables
+        #   3. auto-select the console / platform
+        #   4. auto-link icons
+        added = discover_new_emulators(self.config)
+        exes = autolink_executables(self.config)
+        plats = autolink_platforms(self.config)
+        icons = autolink_icons(self.config)
+
+        if added or exes or plats or icons:
             save_config(self.config)
 
         self.setWindowTitle(APP_NAME)
@@ -866,7 +1409,6 @@ class MainWindow(QMainWindow):
 
         root.addLayout(header)
 
-        # No QScrollArea — the whole grid fits on a 1080p screen.
         self.sections_widget = QWidget()
         self.sections_layout = QVBoxLayout(self.sections_widget)
         self.sections_layout.setContentsMargins(0, 0, 0, 0)
@@ -954,27 +1496,6 @@ class MainWindow(QMainWindow):
                 background:transparent;
                 border:none;
             }
-
-            QScrollBar:vertical {
-                background:#091321;
-                width:10px;
-                border-radius:5px;
-            }
-
-            QScrollBar::handle:vertical {
-                background:#29415f;
-                border-radius:5px;
-                min-height:30px;
-            }
-
-            QScrollBar::handle:vertical:hover {
-                background:#3a5c83;
-            }
-
-            QScrollBar::add-line:vertical,
-            QScrollBar::sub-line:vertical {
-                height:0;
-            }
         """)
 
     def clear_sections(self):
@@ -1033,9 +1554,6 @@ class MainWindow(QMainWindow):
             Qt.AlignmentFlag.AlignLeft
         )
 
-        # 8 columns is plenty for your current library; if a category
-        # ever grows beyond that it will wrap to a second row and the
-        # window will still fit on a 1080p screen for up to ~16 per cat.
         columns = 8
 
         for index, emulator in enumerate(emulators):
@@ -1118,8 +1636,11 @@ class MainWindow(QMainWindow):
 
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.config = load_config()
-            if autolink_icons(self.config):
-                save_config(self.config)
+            discover_new_emulators(self.config)
+            autolink_executables(self.config)
+            autolink_platforms(self.config)
+            autolink_icons(self.config)
+            save_config(self.config)
             self.refresh()
 
     def launch_emulator(self, emulator):
