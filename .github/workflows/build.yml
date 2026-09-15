@@ -1,19 +1,16 @@
-name: Build and Release Console Launcher
+name: Build Console Launcher
 
 on:
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Release version (example: 1.0.0)"
-        required: true
-        default: "1.0.0"
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
 
 jobs:
   build:
-    name: Build Windows application
     runs-on: windows-latest
 
     steps:
@@ -23,54 +20,41 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.12"
 
       - name: Install dependencies
-        shell: powershell
         run: |
           python -m pip install --upgrade pip
-          if (Test-Path "requirements.txt") {
-            pip install -r requirements.txt
+          pip install PySide6 pyinstaller
+
+      - name: Build EXE
+        run: |
+          pyinstaller --onefile --windowed --name "Console Launcher" --icon "EmulatorLauncher.ico" main.py
+
+      - name: Prepare release package
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path release\icons | Out-Null
+          Copy-Item dist\*.exe release\
+          Copy-Item main.py release\
+          Copy-Item EmulatorLauncher.ico release\
+          if (Test-Path icons\*) {
+            Copy-Item icons\* release\icons\ -Recurse -Force
           }
-          pip install pyinstaller
-
-      - name: Build application
-        shell: powershell
-        run: |
-          pyinstaller --noconfirm --clean --onefile --windowed main.py
-
-      - name: Verify build
-        shell: powershell
-        run: |
-          if (-not (Test-Path "dist\ConsoleLauncher.exe")) {
-            Write-Error "ConsoleLauncher.exe was not created."
-            exit 1
-          }
-
-      - name: Create release archive
-        shell: powershell
-        run: |
-          $version = "${{ inputs.version }}"
-          $zipName = "ConsoleLauncher-Windows-x64-v$version.zip"
-
-          Compress-Archive `
-            -Path "dist\ConsoleLauncher.exe" `
-            -DestinationPath $zipName `
-            -Force
-
-          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ConsoleLauncher-Windows-x64
-          path: ${{ env.ZIP_NAME }}
+          name: Console-Launcher-Windows
+          path: release\
 
-      - name: Publish GitHub release
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ inputs.version }}
-          name: Console Launcher v${{ inputs.version }}
+          files: |
+            release/Console Launcher.exe
+            release/main.py
+            release/EmulatorLauncher.ico
+            release/icons/**
           generate_release_notes: true
-          files: ${{ env.ZIP_NAME }}
-          make_latest: true
